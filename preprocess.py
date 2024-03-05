@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import scipy.io as sio
 from sklearn.decomposition import PCA
-from utils import cluster_and_evaluate
+from utils import cluster_and_evaluate, metric_names
 
 
 def load_data(name, process_X='PCA', dim_X=None):
@@ -15,31 +15,22 @@ def load_data(name, process_X='PCA', dim_X=None):
     Y = pool_data["gt"].astype(int).reshape(-1)
     n_clusters = np.unique(Y).shape[0]
     A = get_corelation_matrix(C, False)
-    if process_X == 'random':
-        X = np.random.random((n_input, dim_X))
-    elif process_X == 'one-hot':
-        assert n_input < 5000
-        X = np.diag(np.ones((n_input)))
-    elif process_X == 'A':
-        assert n_input < 5000
-        X = A.copy()
-    else:
-        raw_data = sio.loadmat(name + "_data.mat")
-        X = raw_data["data"]
-        assert C.shape[0] == X.shape[0]
-        if process_X == 'PCA':
-            pca = PCA(n_components=200)
-            X = pca.fit_transform(X)
-        elif process_X == 'norm':
-            niu = np.mean(X, axis=0)
-            theta = np.std(X, axis=0)
-            theta[theta == 0] = 0.1
-            X = (X-niu)/theta
-        elif process_X == 'std':
-            niu = np.max(X, axis=0)
-            theta = niu - np.min(X, axis=0)
-            theta[theta == 0] = 0.1
-            X = (X-niu)/theta
+    raw_data = sio.loadmat(name + "_data.mat")
+    X = raw_data["data"]
+    assert C.shape[0] == X.shape[0]
+    if process_X == 'PCA' or X.shape[1] > 10000:
+        pca = PCA(n_components=dim_X)
+        X = pca.fit_transform(X)
+    elif process_X == 'norm':
+        niu = np.mean(X, axis=0)
+        theta = np.std(X, axis=0)
+        theta[theta == 0] = 0.1
+        X = (X-niu)/theta
+    elif process_X == 'std':
+        niu = np.max(X, axis=0)
+        theta = niu - np.min(X, axis=0)
+        theta[theta == 0] = 0.1
+        X = (X-niu)/theta
     print('dim_X:', X.shape[1])
     return C, Y, X, A, n_clusters, n_input
 
@@ -80,7 +71,7 @@ def verify_pairs(coclass_mat, mat):
 
 
 def get_similar_pairs(C, Y, X, A, soft_A=False, theta=0.95, k=4,
-                      print_neighbour_detail=True, print_knn_detail=False):
+                      print_neighbour_detail=True, print_knn_detail=True):
     n_input, n_clustering_results = C.shape
     assert n_input == X.shape[0]
     if soft_A:
@@ -106,14 +97,9 @@ def get_similar_pairs(C, Y, X, A, soft_A=False, theta=0.95, k=4,
     similarity = torch.exp(-1*distances).fill_diagonal_(0)
     sorted_indices = torch.argsort(similarity, dim=1).flip([1])
     if print_knn_detail:
-        # could be improve by broadcast operation
         for _k in range(1, 20, 1):
-            num_same_label = 0
-            for i in range(n_input):
-                for j in range(_k):
-                    if Y[i] == Y[sorted_indices[i][j]]:
-                        num_same_label += 1
-            print(num_same_label/(_k*n_input))
+            num_same_label = torch.sum(Y.unsqueeze(1) == Y[sorted_indices[:, :_k]])
+            print(num_same_label.item()/(_k*n_input))
     k_neighbours = sorted_indices[:, :k].reshape(-1)
     nodes = torch.repeat_interleave(torch.arange(n_input), k).reshape(-1)
     knn_pairs = torch.stack([nodes, k_neighbours])
@@ -121,13 +107,14 @@ def get_similar_pairs(C, Y, X, A, soft_A=False, theta=0.95, k=4,
     knn_mat[nodes, k_neighbours] = 1
     knn_mat = (knn_mat > 0).triu()
     verify_pairs(coclass_mat, knn_mat)
-    inter = knn_mat & neighbouring_mat
-    verify_pairs(coclass_mat, inter)
-    inter = torch.stack(torch.where(inter))
-    union = knn_mat | neighbouring_mat
-    verify_pairs(coclass_mat, union)
-    union = torch.stack(torch.where(union))
-    return neighbouring_pairs, knn_pairs, inter, union
+    inter_mat = knn_mat & neighbouring_mat
+    verify_pairs(coclass_mat, inter_mat)
+    inter = torch.stack(torch.where(inter_mat))
+    union_mat = knn_mat | neighbouring_mat
+    verify_pairs(coclass_mat, union_mat)
+    union = torch.stack(torch.where(union_mat))
+    return (neighbouring_pairs, knn_pairs, inter, union), \
+        (neighbouring_mat, knn_mat, inter_mat, union_mat)
 
 
 def get_preprocessed_data(name, process_X=None, dim_X=None, theta=0.95, k=4,
@@ -139,14 +126,22 @@ def get_preprocessed_data(name, process_X=None, dim_X=None, theta=0.95, k=4,
     G, metapaths = construct_dgl_graph(C, X)
     C, Y, X, A = torch.tensor(C), torch.tensor(Y), \
         torch.tensor(X, dtype=torch.float64), torch.tensor(A)
-    acc, nmi, ari, f1, _ = cluster_and_evaluate(
+    metric, _ = cluster_and_evaluate(
         X, Y, torch.unique(Y).shape[0])
-    print("raw input clustering result:",
-          "ACC: {:.4f},".format(acc), "NMI: {:.4f},".format(nmi),
-          "ARI: {:.4f},".format(ari), "F1: {:.4f}".format(f1))
-    neighbouring_pairs, knn_pairs, inter, union = get_similar_pairs(
+    line = ','.join([f'{metric_name}: {val:.4f}' 
+                     for metric_name, val in zip(metric_names, metric)])
+    print(line)
+    pairs, pair_mats = get_similar_pairs(
         C, Y, X, A, theta=theta, k=k)
-    return G, metapaths, Y, X, n_clusters, n_input, neighbouring_pairs, knn_pairs, inter, union
+    if process_X == 'random':
+        X = torch.rand((n_input, dim_X))
+    elif process_X == 'one-hot':
+        assert n_input < 5000
+        X = torch.diag(torch.ones((n_input)))
+    elif process_X == 'A':
+        assert n_input < 5000
+        X = A.copy()
+    return G, metapaths, Y, X, n_clusters, n_input, pairs, pair_mats
 
 
 if __name__ == "__main__":

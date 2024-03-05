@@ -10,7 +10,7 @@
             "request": "launch",
             "program": "main.py",
             "console": "integratedTerminal",
-            "args": "-d caltech20 --process_X A -dev cuda:0 -lr 0.00001 --num_epochs 200 --theta 0.7"
+            "args": "-dev cuda:1 -d Mfeat -lr 0.000001 --theta 0.6 -k 32 --lambda_kl 32 --contrast_loss cos --num_epochs 10"
         }
     ]
 }

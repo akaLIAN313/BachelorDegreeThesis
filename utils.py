@@ -24,10 +24,38 @@ def cos_sim(pairs):
     return cosine_similarity(pairs[0], pairs[1]).mean()
 
 
-def sim_loss(pos_pairs, embeddings):
-    embedding_pairs = embeddings[pos_pairs]
-    loss = -1*cos_sim(embedding_pairs)
-    return loss
+def dis_sim(pairs):
+    dis = torch.log(-1*(pairs[0] - pairs[1]).pow(2).sum(dim=1).sqrt()).mean()
+    return dis
+# def dis_sim(pairs):
+    # return torch.einsum('i,i->i', pairs[0], pairs[1])
+
+def sim_loss(pairs, lambdas, embeddings, sim='cos'):
+    if sim == 'cos':
+        loss_f = cos_sim
+    else:
+        loss_f = dis_sim
+    losses = []
+    for pairs, lbd in zip(pairs, lambdas):
+        assert lbd != 0
+        embedding_pairs = embeddings[pairs]
+        loss = -1*lbd*loss_f(embedding_pairs)
+        losses.append(loss)
+    return losses
+
+
+def info_loss(pair_mats: list[torch.Tensor], lambdas, embeddings: torch.Tensor):
+    losses = []
+    norms = embeddings.norm(dim=1)
+    norm_mat = torch.einsum('i,j->ij', norms, norms)
+    for pair_mat, lbd in zip(pair_mats, lambdas):
+        assert lbd != 0
+        sim_mat = torch.einsum('ik,jk->ij', embeddings, embeddings) / norm_mat
+        pos_sim = (sim_mat * pair_mat).exp().sum(dim=1)
+        neg_sim = (sim_mat * ~pair_mat).exp().sum(dim=1)
+        loss = -1*lbd*(pos_sim/neg_sim).log().mean()
+        losses.append(loss)
+    return losses
 
 
 def mutual_info(x, x_aug, temperature=0.2, sym=True):
@@ -64,7 +92,10 @@ def q_distribute(Z: torch.Tensor, cluster_centers):
         the soft assignment distribution Q
     """
     q = 1.0 / (1.0 + torch.sum(torch.pow(Z.unsqueeze(1) - cluster_centers, 2), 2))
-    assert q.min() > 0
+    try:
+        assert q.min() > 1e-5
+    except AssertionError:
+        print(q.min())
     q = (q.t() / torch.sum(q, 1)).t()
     return q
 
@@ -81,7 +112,17 @@ def target_distribution(Q):
     return P
 
 
-def cluster_acc(y_true, y_pred):
+metric_names = ['ACC', 'NMI', 'PUR', 'ARI', 'F1']
+
+def purity_score(y_true, y_pred):
+    from sklearn.metrics.cluster import contingency_matrix
+    # compute contingency matrix (also called confusion matrix)
+    contingency_matrix = contingency_matrix(y_true, y_pred)
+    # return purity
+    return np.sum(np.amax(contingency_matrix, axis=0)) / np.sum(contingency_matrix) 
+
+
+def acc_f1_pur(y_true, y_pred):
     """
     calculate clustering acc and f1-score
     Args:
@@ -94,6 +135,7 @@ def cluster_acc(y_true, y_pred):
     from munkres import Munkres
     y_min = np.min(y_true)
     y_true = y_true - y_min
+    purity = purity_score(y_true, y_pred)
     l1 = list(set(y_true))
     num_class1 = len(l1)
     l2 = list(set(y_pred))
@@ -127,7 +169,7 @@ def cluster_acc(y_true, y_pred):
         new_predict[ai] = c
     acc = metrics.accuracy_score(y_true, new_predict)
     f1_macro = metrics.f1_score(y_true, new_predict, average='macro')
-    return acc, f1_macro
+    return acc, f1_macro, purity
 
 
 def eva(y_true, y_pred, show_details=True):
@@ -141,13 +183,13 @@ def eva(y_true, y_pred, show_details=True):
     """
     from sklearn.metrics import adjusted_rand_score as ari_score
     from sklearn.metrics.cluster import normalized_mutual_info_score as nmi_score
-    acc, f1 = cluster_acc(y_true, y_pred)
+    acc, f1, pur = acc_f1_pur(y_true, y_pred)
     nmi = nmi_score(y_true, y_pred, average_method='arithmetic')
     ari = ari_score(y_true, y_pred)
     if show_details:
         print(':acc {:.4f}'.format(acc), ', nmi {:.4f}'.format(nmi), ', ari {:.4f}'.format(ari),
               ', f1 {:.4f}'.format(f1))
-    return acc, nmi, ari, f1
+    return acc, nmi, pur, ari, f1
 
 
 def cluster_and_evaluate(Z, y, n_clusters):
@@ -163,5 +205,5 @@ def cluster_and_evaluate(Z, y, n_clusters):
     y = np.array(y.to('cpu'))
     model = KMeans(n_clusters, n_init=20)
     cluster_id = model.fit_predict(Z.data.cpu().numpy())
-    acc, nmi, ari, f1 = eva(y, cluster_id, False)
-    return acc, nmi, ari, f1, model.cluster_centers_
+    acc, nmi, pur, ari, f1 = eva(y, cluster_id, False)
+    return (acc, nmi, pur, ari, f1), model.cluster_centers_

@@ -11,7 +11,7 @@ import argparse
 import matplotlib.pyplot as plt
 import tqdm
 from utils import q_distribute, target_distribution, \
-    sim_loss, cluster_and_evaluate
+    metric_names, sim_loss, info_loss, cluster_and_evaluate
 from model import HGIN
 from preprocess import get_preprocessed_data
 
@@ -20,7 +20,11 @@ def store_best_result_and_fig(func):
     @wraps(func)
     def with_loggin(*args, **kwargs):
         run_time = time.strftime("%m-%d-%H:%M:%S")
-        expr_name = f'{run_time}_{expr_args["dataset"]}_{expr_args["process_X"]}'
+        expr_name = f'{run_time}_{expr_args["process_X"]}'
+        if expr_args['iter_arg']:
+            with open(os.path.join(dir, f'{expr_name}.txt'), 'a') as log_file:
+                for arg in cur_args:
+                    print(f'{arg}: {cur_args[arg]}', file=log_file)
         metrics, losses =  func(*args, **kwargs, expr_name=expr_name)
         metrics = np.array(metrics).T
         best_metric = metrics.max(axis=1)
@@ -33,16 +37,15 @@ def store_best_result_and_fig(func):
         for m in range(len(metric_names)):
             metric_ax.plot((range(0, expr_args['num_epochs'])), metrics[m],
                      label=metric_names[m])
-            metric_ax.set_xlabel('Epochs')
-            metric_ax.set_ylabel('Metric Values')
-            metric_ax.legend()
+        metric_ax.set_xlabel('Epochs')
+        metric_ax.set_ylabel('Metric Values')
+        metric_ax.legend()
         losses = np.array(losses).T
-        for m in range(len(loss_names)):
-            loss_ax.plot((range(0, expr_args['num_epochs'])), losses[m],
-                     label=loss_names[m])
-            loss_ax.set_xlabel('Epochs')
-            loss_ax.set_ylabel('Loss Values')
-            loss_ax.legend()
+        for name, lbd, loss in zip(loss_names, lambdas, losses):
+            loss_ax.plot((range(0, expr_args['num_epochs'])), loss, label=name)
+        loss_ax.set_xlabel('Epochs')
+        loss_ax.set_ylabel('Loss Values')
+        loss_ax.legend()
         fig.savefig(os.path.join(dir, f'{run_time}.png'))
     return with_loggin
 
@@ -50,16 +53,19 @@ def store_best_result_and_fig(func):
 @store_best_result_and_fig
 def main(expr_args, expr_name):
     G, meta_paths, labels, features, num_classes, n_input, \
-        neighbouring_pairs, knn_pairs, inter, union = \
+        pairs, pair_mats = \
         get_preprocessed_data(
-            expr_args['dataset'], process_X=expr_args['process_X'],
-            dim_X=expr_args['dim_X'], theta=expr_args['theta'], k=expr_args['k'])
+            expr_args['dataset'],
+            process_X=expr_args['process_X'], dim_X=expr_args['dim_X'],
+            theta=expr_args['theta'], k=expr_args['k'])
+    pair_mats = [pair_mat.to(expr_args['device']) for pair_mat in pair_mats]
     target_node_type = 'entity'
     features = features.to(expr_args['device'], dtype=torch.float32)
     labels = labels.to(expr_args['device'])
 
     model = HGIN(G, features, target_node_type, meta_paths,
-                 in_size=features.shape[1], hidden_size=expr_args['hidden_size'],
+                 in_size=features.shape[1],
+                 hidden_size=expr_args['hidden_size'],
                  out_size=num_classes,
                  num_layers=expr_args['num_layers'],
                  num_mlp_layers=expr_args['num_mlp_layers'],
@@ -71,12 +77,13 @@ def main(expr_args, expr_name):
     miu = nn.Parameter(
         torch.Tensor(
             num_classes,
-            num_classes if expr_args['use_logit'] else expr_args['hidden_size']),
+            num_classes if expr_args['use_logit'] \
+                else expr_args['hidden_size']),
         requires_grad=True)
     if expr_args['initialize'] == 'center':
         with torch.no_grad():
             target_embedding, _ = model(G)
-            _, _, _, _, cluster_centers = cluster_and_evaluate(
+            _, cluster_centers = cluster_and_evaluate(
                 target_embedding, labels, num_classes)
             miu.data = torch.tensor(cluster_centers).to(expr_args['device'])
     else:
@@ -86,7 +93,9 @@ def main(expr_args, expr_name):
         [{'params': model.parameters()}, {'params': miu}],
         lr=expr_args['lr'], weight_decay=expr_args['weight_decay'])
     
-    with open(os.path.join(dir, f'{expr_name}.txt'), 'w') as log_file:
+    
+    
+    with open(os.path.join(dir, f'{expr_name}.txt'), 'a') as log_file:
         metrics = []
         losses = []
         for epoch in tqdm.tqdm(range(expr_args['num_epochs'])):
@@ -95,31 +104,36 @@ def main(expr_args, expr_name):
             Q = q_distribute(target_embedding, miu)
             P = target_distribution(Q)
             loss_kl = F.kl_div(torch.log(Q), P, reduction='batchmean')
-            loss_inter = sim_loss(inter, target_embedding)
-            loss_union = sim_loss(union, target_embedding)
+            if expr_args['contrast_loss'] == 'InfoNCE':
+                contrast_losses = info_loss(
+                    pair_mats, lambdas[1:], target_embedding)
+            else:
+                contrast_losses = sim_loss(pairs, lambdas[1:], target_embedding,
+                                  sim=expr_args['contrast_loss'])
             loss = expr_args['lambda_kl']*loss_kl + \
-                expr_args['lambda_inter']*loss_inter + \
-                expr_args['lambda_union']*loss_union
-            print(loss_kl.item(), loss_inter.item(), loss_union.item(),
+                sum([contrast_loss for contrast_loss in contrast_losses])
+            print(loss_kl.item(),
+                  ' '.join([f'{val}'\
+                            for lbd, val in zip(lambdas[1:], contrast_losses)]),
                   file=log_file)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            losses.append([loss_kl.detach().cpu(),
-                           loss_inter.detach().cpu(), loss_union.detach().cpu()])
-            acc, nmi, ari, f1, _ = cluster_and_evaluate(
+            losses.append(
+                [loss_kl.detach().cpu()] + \
+                [val.detach().cpu()
+                 for lbd, val in zip(lambdas[1:], contrast_losses)]
+            )
+            metric, _ = cluster_and_evaluate(
                 target_embedding, labels, num_classes)
-            print("ACC: {:.4f},".format(acc), "NMI: {:.4f},".format(nmi),
-                "ARI: {:.4f},".format(ari), "F1: {:.4f}".format(f1),
-                file=log_file)
-            metrics.append([acc, nmi, ari, f1])
+            line = [f'{metric_name}: {val:.4f}'
+                for metric_name, val in zip(metric_names, metric)]
+            print(','.join(line), file=log_file)
+            metrics.append(metric)
         return metrics, losses
 
 
 if __name__ == "__main__":
-    metric_names = ['ACC', 'NMI', 'ARI', 'F1']
-    loss_names = ['KL', 'inter', 'union']
-
     parser = argparse.ArgumentParser('Bachelor')
     parser.add_argument('-s', '--seed', type=int,
                         default=1, help='Random seed')
@@ -131,8 +145,6 @@ if __name__ == "__main__":
                         choices=['origin', 'random', 'one-hot',
                                  'norm', 'std', 'PCA', 'A'])
     parser.add_argument('--dim_X', type=int, default=300)
-    parser.add_argument('-p', type=str, default='inter',
-                        choices=['inter', 'union', 'knn', 'neigubour'])
     parser.add_argument('--theta', type=float, default=0.95)
     parser.add_argument('-k', type=int, default=4)
     parser.add_argument('-ini', '--initialize',
@@ -144,40 +156,57 @@ if __name__ == "__main__":
     parser.add_argument('-lg', '--use_logit',
                         action='store_true')
 
-    parser.add_argument('--num_epochs', type=int, default=500)
+    parser.add_argument('--num_epochs', type=int, default=300)
     parser.add_argument('-lr', type=float, default=0.0001)
     parser.add_argument('--dropout', type=float, default=0.01)
     parser.add_argument('--weight_decay', type=float, default=2e-5)
+    parser.add_argument('--contrast_loss', type=str, default='InfoNCE',
+                        choices=['InfoNCE', 'cos', 'dis'])
     parser.add_argument('-l1', '--lambda_kl', type=float, default=1)
+    parser.add_argument('--lambda_neigh', type=float, default=0)
+    parser.add_argument('--lambda_knn', type=float, default=0)
     parser.add_argument('-l2', '--lambda_inter', type=float, default=2**3)
     parser.add_argument('-l3', '--lambda_union', type=float, default=2**3)
     expr_args = parser.parse_args().__dict__
-    config_set = {
-        'lr': [0.1**i for i in range(3, 5)],
-        'lambda_inter': [2**i for i in range(4, 7, 2)],
-        'lambda_union': [2**i for i in range(0, 5, 2)],
-        'k': [2**i for i in range(1, 6, 2)],
-        'hidden_size': [2**i for i in range(7, 10)]
-    }
-    arg_set = config_set.keys()
-    val_sets = config_set.values()
-    combinations = product(*val_sets)
+
+    
+    lambdas = [expr_args['lambda_kl'],
+               expr_args['lambda_neigh'], expr_args['lambda_knn'],
+               expr_args['lambda_inter'], expr_args['lambda_union']]
+    loss_names = ['KL'] + ['neigh', 'knn', 'inter', 'union']
+    loss_list = [(lbd, name) for lbd, name in zip(lambdas, loss_names)
+                 if lbd != 0]
+    lambdas, loss_names = zip(*loss_list)
+    
     expr_time = time.strftime("%m-%d-%H:%M")
-    dir = f'logs/{expr_time}_{expr_args["dataset"]}'
-    os.mkdir(dir)
+    dir = f'logs/{expr_args["dataset"]}/{expr_time}_{expr_args["dataset"]}'
+    os.makedirs(dir, exist_ok=True)
     sum_filename = os.path.join(dir, 'summary.txt')
     if expr_args['iter_arg']:
+        vary_arg_dict = {
+            'lr': [0.1**i for i in range(4, 7)],
+            'lambda_inter': [2**i for i in range(4, 7, 2)],
+            'lambda_union': [2**i for i in range(4, 7, 2)],
+            'lambda_neigh': [2**i for i in range(4, 7, 2)],
+            'k': [2**i for i in range(2, 5, 2)],
+            'theta': [0.7+i/10 for i in range(0, 3)],
+            'hidden_size': [2**i for i in range(8, 10)]
+        }
+        vary_arg_set = vary_arg_dict.keys()
+        val_sets = vary_arg_dict.values()
         with open(sum_filename, 'w') as f:
-            fix_arg = set(expr_args.keys()) - set(arg_set)
-            for arg in fix_arg:
+            fixed_arg = set(expr_args.keys()) - set(vary_arg_set)
+            for arg in fixed_arg:
                 print(f'{arg}: {expr_args[arg]}', file=f)
-        for comb in combinations:
-            config = dict(zip(arg_set, comb))
-            expr_args.update(config)
+        combinations = product(*val_sets)
+        for i, comb in enumerate(combinations):
+            print(f'{i} of {len} combinations')
+            cur_args = dict(zip(vary_arg_set, comb))
+            expr_args.update(cur_args)
             main(expr_args)
-    else:
+    else:   
         with open(sum_filename, 'w') as f:
-            fix_arg = set(expr_args.keys())
-            for arg in fix_arg:
+            fixed_arg = set(expr_args.keys())
+            for arg in fixed_arg:
                 print(f'{arg}: {expr_args[arg]}', file=f)
         main(expr_args)
