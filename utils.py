@@ -45,6 +45,7 @@ def sim_loss(pairs, lambdas, embeddings, sim='cos'):
 
 
 def info_loss(pair_mats: list[torch.Tensor], lambdas, embeddings: torch.Tensor):
+    # there is problem! should be examined
     losses = []
     norms = embeddings.norm(dim=1)
     norm_mat = torch.einsum('i,j->ij', norms, norms)

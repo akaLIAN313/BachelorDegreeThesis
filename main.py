@@ -16,7 +16,7 @@ from model import HGIN
 from preprocess import get_preprocessed_data
 
 
-def store_best_result_and_fig(func):
+def log_best_and_draw(func):
     @wraps(func)
     def with_loggin(*args, **kwargs):
         run_time = time.strftime("%m-%d-%H:%M:%S")
@@ -50,7 +50,7 @@ def store_best_result_and_fig(func):
     return with_loggin
 
 
-@store_best_result_and_fig
+@log_best_and_draw
 def main(expr_args, expr_name):
     G, meta_paths, labels, features, num_classes, n_input, \
         pairs, pair_mats = \
@@ -128,7 +128,7 @@ def main(expr_args, expr_name):
                 target_embedding, labels, num_classes)
             line = [f'{metric_name}: {val:.4f}'
                 for metric_name, val in zip(metric_names, metric)]
-            print(','.join(line), file=log_file)
+            print(','.join(line), file=log_file, flush=True)
             metrics.append(metric)
         return metrics, losses
 
@@ -196,7 +196,7 @@ if __name__ == "__main__":
         val_sets = vary_arg_dict.values()
         with open(sum_filename, 'w') as f:
             fixed_arg = set(expr_args.keys()) - set(vary_arg_set)
-            for arg in fixed_arg:
+            for arg in sorted(fixed_arg):
                 print(f'{arg}: {expr_args[arg]}', file=f)
         combinations = product(*val_sets)
         for i, comb in enumerate(combinations):
@@ -207,6 +207,6 @@ if __name__ == "__main__":
     else:   
         with open(sum_filename, 'w') as f:
             fixed_arg = set(expr_args.keys())
-            for arg in fixed_arg:
+            for arg in sorted(fixed_arg):
                 print(f'{arg}: {expr_args[arg]}', file=f)
         main(expr_args)
