@@ -19,6 +19,17 @@ def set_random_seed(seed=0):
         torch.cuda.manual_seed(seed)
 
 
+def get_subset_index(Y: torch.Tensor, n=3):
+    Y = Y-Y.min()
+    unique_labels = torch.unique(Y)
+    label_counts = torch.bincount(Y)
+    selected = torch.zeros(Y.shape, dtype=torch.long)
+    for label in unique_labels:
+        selected[Y == label] = torch.arange(label_counts[label])
+    return selected<n
+    
+
+
 def cos_sim(pairs):
     from torch.nn.functional import cosine_similarity
     return cosine_similarity(pairs[0], pairs[1]).mean()
