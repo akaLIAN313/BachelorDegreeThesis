@@ -20,7 +20,7 @@ def log_best_and_draw(func):
     @wraps(func)
     def with_loggin(*args, **kwargs):
         run_time = time.strftime("%m-%d-%H:%M:%S")
-        expr_name = f'{run_time}_{expr_args["process_X"]}'
+        expr_name = f'{run_time}'
         if expr_args['iter_arg']:
             with open(os.path.join(dir, f'{expr_name}.txt'), 'a') as log_file:
                 for arg in cur_args:
@@ -33,7 +33,7 @@ def log_best_and_draw(func):
             line = [f'{metric_name}: {val:.4f}'
                     for metric_name, val in zip(metric_names, best_metric)]
             f.write(',  '.join(line)+'\n')
-        fig, (metric_ax, loss_ax) = plt.subplots(2, 1)
+        fig, (metric_ax, loss_ax) = plt.subplots(2, 1, layout='constrained')
         for m in range(len(metric_names)):
             metric_ax.plot((range(0, expr_args['num_epochs'])), metrics[m],
                      label=metric_names[m])
@@ -42,11 +42,17 @@ def log_best_and_draw(func):
         metric_ax.legend()
         losses = np.array(losses).T
         for name, lbd, loss in zip(loss_names, lambdas, losses):
-            loss_ax.plot((range(0, expr_args['num_epochs'])), loss, label=name)
+            if name == 'KL':
+                kl_ax = loss_ax.twinx()
+                kl_ax.plot((range(0, expr_args['num_epochs'])), loss,
+                           label=name, color='r')
+            else:
+                loss_ax.plot((range(0, expr_args['num_epochs'])), loss,
+                             label=name)
         loss_ax.set_xlabel('Epochs')
         loss_ax.set_ylabel('Loss Values')
         loss_ax.legend()
-        fig.savefig(os.path.join(dir, f'{run_time}.png'))
+        fig.savefig(os.path.join(dir, f'{run_time}.png'), dpi=1200)
     return with_loggin
 
 
@@ -93,8 +99,6 @@ def main(expr_args, expr_name):
         [{'params': model.parameters()}, {'params': miu}],
         lr=expr_args['lr'], weight_decay=expr_args['weight_decay'])
     
-    
-    
     with open(os.path.join(dir, f'{expr_name}.txt'), 'a') as log_file:
         metrics = []
         losses = []
@@ -137,10 +141,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser('Bachelor')
     parser.add_argument('-s', '--seed', type=int,
                         default=1, help='Random seed')
-    parser.add_argument('-dev', '--device', type=str, default='cuda:1')
+    parser.add_argument('-dev', '--device', type=str, default='cuda:0')
 
     parser.add_argument('--iter_arg', action='store_true')
     parser.add_argument('-d', '--dataset', type=str, default='binalpha')
+
     parser.add_argument('--process_X', type=str, default='origin',
                         choices=['origin', 'random', 'one-hot',
                                  'norm', 'std', 'PCA', 'A'])
@@ -157,10 +162,10 @@ if __name__ == "__main__":
                         action='store_true')
 
     parser.add_argument('--num_epochs', type=int, default=300)
-    parser.add_argument('-lr', type=float, default=0.0001)
+    parser.add_argument('-lr', type=float, default=1e-5)
     parser.add_argument('--dropout', type=float, default=0.01)
     parser.add_argument('--weight_decay', type=float, default=2e-5)
-    parser.add_argument('--contrast_loss', type=str, default='InfoNCE',
+    parser.add_argument('--contrast_loss', type=str, default='cos',
                         choices=['InfoNCE', 'cos', 'dis'])
     parser.add_argument('-l1', '--lambda_kl', type=float, default=1)
     parser.add_argument('--lambda_neigh', type=float, default=0)
@@ -184,15 +189,15 @@ if __name__ == "__main__":
     sum_filename = os.path.join(dir, 'summary.txt')
     if expr_args['iter_arg']:
         vary_arg_dict = {
-            'lr': [0.1**i for i in range(4, 7)],
-            'lambda_inter': [2**i for i in range(4, 7, 2)],
-            'lambda_union': [2**i for i in range(4, 7, 2)],
-            'lambda_neigh': [2**i for i in range(4, 7, 2)],
-            'k': [2**i for i in range(2, 5, 2)],
-            'theta': [0.7+i/10 for i in range(0, 3)],
-            'hidden_size': [2**i for i in range(8, 10)]
+            # 'lambda_inter': [0, 2, 4, 8, 16],
+            # 'lambda_union': [0, 2, 4, 8, 16],
+            'k': [2, 4, 8, 16, 32],
+            'theta': [0.6+i/10 for i in range(0, 4)],
         }
         vary_arg_set = vary_arg_dict.keys()
+        combination_num = 1
+        for arg in vary_arg_dict:
+            combination_num = combination_num * len(vary_arg_dict[arg])
         val_sets = vary_arg_dict.values()
         with open(sum_filename, 'w') as f:
             fixed_arg = set(expr_args.keys()) - set(vary_arg_set)
@@ -200,7 +205,7 @@ if __name__ == "__main__":
                 print(f'{arg}: {expr_args[arg]}', file=f)
         combinations = product(*val_sets)
         for i, comb in enumerate(combinations):
-            print(f'{i} of {len} combinations')
+            print(f'{i} of {combination_num} combinations')
             cur_args = dict(zip(vary_arg_set, comb))
             expr_args.update(cur_args)
             main(expr_args)

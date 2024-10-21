@@ -11,6 +11,7 @@ def load_data(name, process_X='PCA', dim_X=None):
     name = "./data/" + name
     pool_data = sio.loadmat(name + "_pool_half_vary_k.mat")
     C = pool_data["members"].astype(int)
+    C = C[:,np.random.randint(0, C.shape[1], (10))]
     n_input = C.shape[0]
     Y = pool_data["gt"].astype(int).reshape(-1)
     n_clusters = np.unique(Y).shape[0]
@@ -69,10 +70,12 @@ def verify_pairs(coclass_mat, mat):
     n_pair = torch.sum(mat)
     chance_same_label = n_same_label.float() / n_pair
     print(f'pairs: {n_pair.item()}, {chance_same_label.item():.3f}')
+    return n_pair, chance_same_label
 
 
 def get_similar_pairs(C, Y, X, A, soft_A=False, theta=0.95, k=4,
-                      print_neighbour_detail=False, print_knn_detail=True):
+                      print_neighbour_detail=False, print_knn_detail=False,
+                      return_eva=False):
     n_input, n_clustering_results = C.shape
     assert n_input == X.shape[0]
     if soft_A:
@@ -85,13 +88,14 @@ def get_similar_pairs(C, Y, X, A, soft_A=False, theta=0.95, k=4,
             n_same_label = torch.sum(
                 above_threshold &
                 coclass_mat.triu())
+            
             n_pairs_above_threshold = torch.sum(above_threshold)
             chance_same_label = n_same_label.float() / n_pairs_above_threshold.float()
             print(
                 f'{threshold:.2f}, {n_same_label.item()},',
                 f'{n_pairs_above_threshold.item():.3f}')
     neighbouring_mat = A.fill_diagonal_(0).triu() > theta
-    verify_pairs(coclass_mat, neighbouring_mat)
+    n_A, acc_A = verify_pairs(coclass_mat, neighbouring_mat)
     neighbouring_pairs = torch.where(neighbouring_mat)
     neighbouring_pairs = torch.stack(neighbouring_pairs)
     # similarity = np.matmul(X, X.T)/np.float_power(np.linalg.norm(X, axis=1), 2)
@@ -110,15 +114,19 @@ def get_similar_pairs(C, Y, X, A, soft_A=False, theta=0.95, k=4,
     knn_mat = torch.zeros((n_input, n_input))
     knn_mat[nodes, k_neighbours] = 1
     knn_mat = (knn_mat > 0).triu()
-    verify_pairs(coclass_mat, knn_mat)
+    n_knn, acc_knn = verify_pairs(coclass_mat, knn_mat)
     inter_mat = knn_mat & neighbouring_mat
-    verify_pairs(coclass_mat, inter_mat)
+    n_inter, acc_inter = verify_pairs(coclass_mat, inter_mat)
     inter = torch.stack(torch.where(inter_mat))
     union_mat = knn_mat | neighbouring_mat
-    verify_pairs(coclass_mat, union_mat)
+    n_union, acc_union = verify_pairs(coclass_mat, union_mat)
     union = torch.stack(torch.where(union_mat))
-    return (neighbouring_pairs, knn_pairs, inter, union), \
-        (neighbouring_mat, knn_mat, inter_mat, union_mat)
+    if return_eva:
+        return (n_A, n_knn, n_inter, n_union), \
+            (acc_A, acc_knn, acc_inter, acc_union)
+    else:
+        return (neighbouring_pairs, knn_pairs, inter, union), \
+            (neighbouring_mat, knn_mat, inter_mat, union_mat)
 
 
 def get_preprocessed_data(name, process_X=None, dim_X=None, theta=0.95, k=4,
